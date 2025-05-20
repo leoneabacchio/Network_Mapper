@@ -5,46 +5,85 @@ import requests
 import re
 import subprocess
 from datetime import datetime
-
-# Use the WMI module for gateway discovery
 import wmi
+import ipaddress
 
 # ─────────────── CONFIG ───────────────
 SERVER_URL = "http://localhost:5000/api/ingest"
 INTERVAL   = 60  # seconds between posts
 # ────────────────────────────────────────
 
+def get_interface_network():
+    """
+    Use WMI to find the network (IPv4 address + mask) of the primary interface.
+    Returns an IPv4Network object, or None on failure.
+    """
+    c = wmi.WMI()
+    for nic in c.Win32_NetworkAdapterConfiguration(IPEnabled=True):
+        addrs = nic.IPAddress or []
+        subnets = nic.IPSubnet or []
+        # Look for the one matching our chosen HOST_IP
+        for ip, mask in zip(addrs, subnets):
+            try:
+                # build network
+                net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+                # pick the first non-loopback, non-APIPA
+                if not net.network_address.is_loopback and not ip.startswith("169.254"):
+                    return net
+            except Exception:
+                continue
+    return None
+
 def get_primary_ip():
-    """Return the first non-loopback IPv4 address."""
+    """
+    Return the first non-loopback IPv4 address on the machine.
+    This should match one of the addresses from get_interface_network().
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 53))
         return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        return None
     finally:
         s.close()
 
+# Determine our network and IP once at startup
+NET = get_interface_network()
 HOST_IP = get_primary_ip()
+if NET:
+    print(f"[{datetime.now().isoformat()}] Detected network: {NET}, host IP: {HOST_IP}")
+else:
+    print(f"[{datetime.now().isoformat()}] Could not detect network; HOST_IP={HOST_IP}")
 
 def collect_physical_neighbors():
     """
-    Run `arp -a` and extract only real Layer-2 neighbors:
+    Run `arp -a` and extract only those neighbors whose IP falls in our subnet.
+    Skips broadcast/multicast and VMware MACs as before.
     """
     neighbors = []
     try:
-        out = subprocess.check_output(
-            ["arp", "-a"], text=True, stderr=subprocess.DEVNULL
-        )
+        out = subprocess.check_output(["arp", "-a"], text=True, stderr=subprocess.DEVNULL)
         for line in out.splitlines():
             m = re.match(r'\s*([\d\.]+)\s+([\da-fA-F\-]+)\s+\w+', line)
             if not m:
                 continue
-            ip, mac = m.groups()
-            if mac.lower() == "ff-ff-ff-ff-ff-ff": continue
-            if ip.startswith("224.") or ip.startswith("239.") or ip == "255.255.255.255": continue
-            if ip == HOST_IP: continue
-            neighbors.append(ip)
+            ip_str, mac = m.groups()
+            ip = ipaddress.IPv4Address(ip_str)
+            mac = mac.lower()
+
+            # Filter: only hosts in our NET
+            if NET and ip not in NET:
+                continue
+
+            # Skip broadcast/multicast
+            if mac == "ff-ff-ff-ff-ff-ff":       continue
+            if ip.is_multicast or ip.is_reserved: continue
+            # Skip VMware virtual MACs if you still want:
+            # if any(mac.startswith(oui) for oui in VMWARE_OUIS): continue
+            if ip_str == HOST_IP:                 continue
+
+            neighbors.append(ip_str)
     except Exception:
         pass
     return neighbors
@@ -58,27 +97,25 @@ def get_default_gateway_wmi():
         for nic in c.Win32_NetworkAdapterConfiguration(IPEnabled=True):
             gws = nic.DefaultIPGateway
             if gws:
-                # DefaultIPGateway is a list; take the first
                 return gws[0]
     except Exception:
         pass
     return None
 
 if __name__ == "__main__":
-    print(f"[{datetime.now().isoformat()}] Windows agent starting; posting every {INTERVAL}s as {HOST_IP}")
+    print(f"[{datetime.now().isoformat()}] Agent starting; posting every {INTERVAL}s")
 
     while True:
-        neighbors      = collect_physical_neighbors()
+        neighbors       = collect_physical_neighbors()
         default_gateway = get_default_gateway_wmi()
 
         payload = {
-            "host": HOST_IP,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "neighbors": neighbors,
+            "host":            HOST_IP,
+            "timestamp":       datetime.utcnow().isoformat() + "Z",
+            "neighbors":       neighbors,
             "default_gateway": default_gateway
         }
 
-        # Debug: print what we're sending
         print(f"[{datetime.now().isoformat()}] Payload:", payload)
 
         try:
